@@ -16,6 +16,7 @@
  */
 package tech.beshu.ror.es.request
 
+import java.net.URLClassLoader
 import java.util.UUID
 import java.{lang, util}
 
@@ -49,6 +50,9 @@ import org.elasticsearch.search.builder.SearchSourceBuilder
 import org.elasticsearch.threadpool.ThreadPool
 import org.elasticsearch.transport.RemoteClusterService
 import org.reflections.ReflectionUtils
+import sun.misc.Launcher
+import sun.misc.Launcher.AppClassLoader
+import tech.beshu.ror.es.request.RequestInfo.SearchTemplateRequestIndices
 import tech.beshu.ror.es.utils.ClusterServiceHelper._
 import tech.beshu.ror.shims.request.RequestInfoShim
 import tech.beshu.ror.utils.LoggerOps._
@@ -57,6 +61,7 @@ import tech.beshu.ror.utils.{RCUtils, ReflecUtils}
 
 import scala.collection.JavaConverters._
 import scala.math.Ordering.comparatorToOrdering
+import scala.reflect.internal.util.ScalaClassLoader
 import scala.util.{Failure, Success, Try}
 
 class RequestInfo(channel: RestChannel, taskId: lang.Long, action: String, actionRequest: ActionRequest,
@@ -74,9 +79,9 @@ class RequestInfo(channel: RestChannel, taskId: lang.Long, action: String, actio
 
   override val extractTaskId: lang.Long = taskId
 
-  override lazy val extractContentLength: Integer = if(request.content == null) 0 else request.content().length()
+  override lazy val extractContentLength: Integer = if (request.content == null) 0 else request.content().length()
 
-  override lazy val extractContent: String = if(request.content == null) "" else request.content().utf8ToString()
+  override lazy val extractContent: String = if (request.content == null) "" else request.content().utf8ToString()
 
   override lazy val extractMethod: String = request.method().name()
 
@@ -121,10 +126,11 @@ class RequestInfo(channel: RestChannel, taskId: lang.Long, action: String, actio
         // Do noting, we can't do anything about X-Pack SQL queries, as it does not contain indices.
         // todo: The only way we can filter this kind of request is going Lucene level like "filter" rule.
         Set.empty[String]
-      case ar if ar.getClass.getSimpleName.startsWith("SearchTemplateRequest") =>
-        invokeMethodCached(ar, ar.getClass, "getRequest")
-          .asInstanceOf[SearchRequest]
-          .indices().toSet
+      //      case ar if ar.getClass.getSimpleName.startsWith("SearchTemplateRequest") =>
+      //        invokeMethodCached(ar, ar.getClass, "getRequest")
+      //          .asInstanceOf[SearchRequest]
+      //          .indices().toSet
+      case SearchTemplateRequestIndices(indices) => indices
       case ar: CompositeIndicesRequest =>
         logger.error(s"Found an instance of CompositeIndicesRequest that could not be handled: report this as a bug immediately! ${ar.getClass.getSimpleName}")
         Set.empty[String]
@@ -132,11 +138,11 @@ class RequestInfo(channel: RestChannel, taskId: lang.Long, action: String, actio
         ar.indices().toSet
       case ar: PutIndexTemplateRequest =>
         indicesFromPatterns(clusterService, ar.indices.toSet)
-          .flatMap { case (pattern, relatedIndices) => if(relatedIndices.nonEmpty) relatedIndices else Set(pattern) }
+          .flatMap { case (pattern, relatedIndices) => if (relatedIndices.nonEmpty) relatedIndices else Set(pattern) }
           .toSet
       case ar =>
         val indices = extractStringArrayFromPrivateMethod("indices", ar).toSet
-        if(indices.isEmpty) extractStringArrayFromPrivateMethod("index", ar).toSet
+        if (indices.isEmpty) extractStringArrayFromPrivateMethod("index", ar).toSet
         else indices
     }
     logger.debug(s"Discovered indices: ${indices.mkString(",")}")
@@ -147,7 +153,7 @@ class RequestInfo(channel: RestChannel, taskId: lang.Long, action: String, actio
     val patterns = actionRequest match {
       case ar: GetIndexTemplatesRequest =>
         val templates = ar.names().toSet
-        if(templates.isEmpty) getIndicesPatternsOfTemplates(clusterService)
+        if (templates.isEmpty) getIndicesPatternsOfTemplates(clusterService)
         else getIndicesPatternsOfTemplates(clusterService, templates)
       case ar: PutIndexTemplateRequest =>
         ar.indices().toSet
@@ -303,7 +309,7 @@ class RequestInfo(channel: RestChannel, taskId: lang.Long, action: String, actio
 
     actionRequest match {
       case ar: IndicesRequest.Replaceable if extractURI.startsWith("/_cat/templates") =>
-        // workaround for filtering templates of /_cat/templates action
+      // workaround for filtering templates of /_cat/templates action
       case ar: IndicesRequest.Replaceable => // Best case, this request is designed to have indices replaced.
         ar.indices(indices: _*)
       case ar: BulkShardRequest => // This should not be necessary anymore because nowadays we either allow or forbid write requests.
@@ -381,5 +387,61 @@ class RequestInfo(channel: RestChannel, taskId: lang.Long, action: String, actio
         if (okSetResult) logger.debug(s"REFLECTION: success changing indices: $indices correctly set as $extractIndices")
         else logger.error(s"REFLECTION: Failed to set indices for type ${actionRequest.getClass.getSimpleName} in req id: $extractId")
     }
+  }
+}
+object RequestInfo {
+  private object SearchTemplateRequestIndices
+    extends Logging {
+    private val className = "SearchTemplateRequest"
+
+    def unapply(arg: CompositeIndicesRequest): Option[Set[String]] = {
+      if (arg.getClass.getCanonicalName.contains(className)) {
+        val pluiginClassLoader = arg.getClass.getClassLoader
+        val contextClassLoader = Thread.currentThread().getContextClassLoader
+        logger.info(s"Plugin class loader: ${pluiginClassLoader}")
+        logger.info("request class: org.elasticsearch.script.mustache.SearchTemplateRequest")
+        logger.info(s"${pluiginClassLoader.loadClass("org.elasticsearch.script.mustache.SearchTemplateRequest")}")
+        //        contextClassLoader.loadClass()
+        try {
+          val cl = ScalaClassLoader.fromURLs(ScalaClassLoader.originOfClass(arg.getClass).toList)
+          Thread.currentThread().setContextClassLoader(new MyClassLoader(cl))
+          logger.info(s"Context class loader ${Thread.currentThread().getContextClassLoader} ${Thread.currentThread().getContextClassLoader.getParent eq pluiginClassLoader }")
+          logger.info(s"loaded urls${pluiginClassLoader.asInstanceOf[URLClassLoader].getURLs.map(_.toString).toList}")
+          val a = Launcher.getLauncher.getClassLoader.asInstanceOf[URLClassLoader]
+          MustacheAwareLoader.unapply(arg)
+        } catch {
+          case e: NoClassDefFoundError =>
+            throw IndicesClassNotFoundOnClasspath(arg.getClass.getCanonicalName, e)
+        } finally {
+          Thread.currentThread().setContextClassLoader(contextClassLoader)
+        }
+      } else None
+    }
+  }
+  final case class IndicesClassNotFoundOnClasspath(className: String, error: NoClassDefFoundError)
+    extends Error(s"$className recognized, but not found on classpath", error)
+}
+object MustacheAwareLoader extends Logging{
+  def unapply(arg: CompositeIndicesRequest): Option[Set[String]] = {
+    if (arg.isInstanceOf[org.elasticsearch.script.mustache.SearchTemplateRequest]) {
+      val indices = arg.asInstanceOf[org.elasticsearch.script.mustache.SearchTemplateRequest]
+        .getRequest.indices().toSet
+      Some(indices)
+    } else {
+      logger.error(s"${arg.getClass.getCanonicalName} is not instance of ${classOf[org.elasticsearch.script.mustache.SearchTemplateRequest]}")
+      Some(Set.empty)
+    }
+  }
+}
+final class MyClassLoader(parent: ClassLoader)extends ClassLoader with Logging{
+
+  override def loadClass(name: IndexName): Class[_] = {
+    logger.info(s"loading class $name")
+    super.loadClass(name)
+  }
+
+  override def loadClass(name: IndexName, resolve: Boolean): Class[_] = {
+    logger.info(s"loading class $name [$resolve]")
+    super.loadClass(name, resolve)
   }
 }

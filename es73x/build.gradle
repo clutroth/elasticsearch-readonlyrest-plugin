@@ -55,7 +55,7 @@ dependencies {
 
     compile 'org.elasticsearch:elasticsearch:' + esVersion
     compile 'org.elasticsearch.plugin:transport-netty4-client:' + esVersion
-
+    compileOnly group: 'org.elasticsearch.plugin', name: 'lang-mustache-client', version: esVersion
     compile group: 'org.apache.logging.log4j',              name: 'log4j-core',           version: '2.11.0'
 }
 
